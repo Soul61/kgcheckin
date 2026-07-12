@@ -2,7 +2,7 @@ import { printBlue, printGreen, printMagenta, printRed, printYellow } from "./ut
 import { hasSecretWriteToken, setRepoSecret } from "./utils/githubSecrets.js";
 import { maskDisplayName, maskIdentifier, sanitizeForLog, summarizeResponse } from "./utils/safeLog.js";
 import { sendNotify } from "./utils/notify.js";
-import { close_api, delay, send, startService } from "./utils/utils.js";
+import { close_api, delay, send, startService, waitForApi } from "./utils/utils.js";
 
 async function main() {
 
@@ -14,9 +14,14 @@ async function main() {
   }
   const userinfo = JSON.parse(USERINFO)
 
-  // 启动服务
+  // 启动服务并等待就绪（避免冷启动竞态导致首个请求失败）
   const api = startService()
-  await delay(2000)
+  try {
+    await waitForApi()
+  } catch (e) {
+    close_api(api)
+    throw e
+  }
 
   const today = new Date();
   // 服务器时间比国内慢8小时
@@ -35,104 +40,122 @@ async function main() {
   try {
     // 开始签到
     for (const user of userinfo) {
-      const headers = { 'cookie': 'token=' + user.token + '; userid=' + user.userid }
-      const userDetail = await send(`/user/detail?timestrap=${Date.now()}`, "GET", headers)
-      if (userDetail?.data?.nickname == null) {
-        const safeUserId = maskIdentifier(user.userid)
-        printRed(`token过期或账号不存在, userid: ${safeUserId}`)
-        errorMsg[safeUserId] = {
-          msg: `token过期或账号不存在, userid: ${safeUserId}`,
-          data: summarizeResponse(userDetail)
+      // 单账号异常隔离：任何一个账号的请求/解析出错，只记录该账号失败，
+      // 不影响其余账号继续执行，也保证后续通知与 secret 刷新一定能触发。
+      try {
+        const headers = { 'cookie': 'token=' + user.token + '; userid=' + user.userid }
+        const userDetail = await send(`/user/detail?timestrap=${Date.now()}`, "GET", headers)
+        if (userDetail?.data?.nickname == null) {
+          const safeUserId = maskIdentifier(user.userid)
+          printRed(`token过期或账号不存在, userid: ${safeUserId}`)
+          errorMsg[safeUserId] = {
+            msg: `token过期或账号不存在, userid: ${safeUserId}`,
+            data: summarizeResponse(userDetail)
+          }
+          notifyResults.push({
+            nickname: safeUserId,
+            status: '失败',
+            listen: '账号不存在',
+            vipClaim: '0/8',
+            vipExpiry: '未知',
+            error: 'token过期或账号不存在'
+          })
+          hasError = true
+          continue
         }
+        const safeNickname = maskDisplayName(userDetail.data.nickname)
+        printMagenta(`账号 ${safeNickname} 开始领取VIP...`)
+
+        // 周日刷新token
+        if (today.getDay() === 0) {
+          const refreshToken = await send(`/login/token?timestrap=${Date.now()}`, "POST", headers)
+          if (refreshToken?.status == 1) {
+            if (refreshToken?.data?.token !== user.token) {
+              needRefresh = true
+              printYellow(`账号 ${safeNickname} 需要刷新token`)
+              user.token = refreshToken.data.token
+            }
+          }
+        }
+
+        // 开始听歌
+        printYellow(`开始听歌领取VIP...`)
+        // 听歌获取vip
+        const listen = await send(`/youth/listen/song?timestrap=${Date.now()}`, "GET", headers)
+
+        let listenStatus = '未知'
+        if (listen.status === 1) {
+          printGreen("听歌领取成功")
+          listenStatus = '成功'
+        } else if (listen.error_code === 130012) {
+          printGreen("今日已领取")
+          listenStatus = '今日已领取'
+        } else {
+          errorMsg[`${safeNickname} listen`] = summarizeResponse(listen)
+          printRed("听歌领取失败")
+          listenStatus = '失败'
+          hasError = true
+        }
+
+        printYellow("开始领取VIP...")
+        let claimCount = 0
+        let claimTotal = 0
+        for (let i = 1; i <= 8; i++) {
+          // ad获取vip
+          const ad = await send(`/youth/vip?timestrap=${Date.now()}`, "GET", headers)
+          claimTotal = i
+          if (ad.status === 1) {
+            printGreen(`第${i}次领取成功`)
+            claimCount++
+            if (i != 8) {
+              await delay(30 * 1000)
+            }
+          } else if (ad.error_code === 30002) {
+            printGreen("今天次数已用光")
+            break
+          } else {
+            printRed(`第${i}次领取失败`)
+            errorMsg[`${safeNickname} ad`] = summarizeResponse(ad)
+            hasError = true
+            break
+          }
+        }
+
+        let vipExpiry = '未知'
+        const vip_details = await send(`/user/vip/detail?timestrap=${Date.now()}`, "GET", headers)
+        if (vip_details.status === 1 && Array.isArray(vip_details.data?.busi_vip) && vip_details.data.busi_vip.length > 0) {
+          vipExpiry = vip_details.data.busi_vip[0].vip_end_time
+          printBlue(`今天是：${date}`)
+          printBlue(`VIP到期时间：${vipExpiry}\n`)
+        } else {
+          printRed("获取失败\n")
+          errorMsg[`${safeNickname} vip_details`] = summarizeResponse(vip_details)
+          hasError = true
+        }
+
+        notifyResults.push({
+          nickname: safeNickname,
+          status: listenStatus === '失败' || claimCount === 0 ? '部分失败' : '成功',
+          listen: listenStatus,
+          vipClaim: `${claimCount}/${claimTotal}`,
+          vipExpiry,
+          error: ''
+        })
+      } catch (err) {
+        const safeUserId = maskIdentifier(user.userid || '未知')
+        printRed(`账号 ${safeUserId} 处理异常：${err && err.message ? err.message : String(err)}`)
+        errorMsg[safeUserId] = { msg: '处理异常', error: err && err.message ? err.message : String(err) }
         notifyResults.push({
           nickname: safeUserId,
           status: '失败',
-          listen: '账号不存在',
+          listen: '异常',
           vipClaim: '0/8',
           vipExpiry: '未知',
-          error: 'token过期或账号不存在'
+          error: err && err.message ? err.message : String(err)
         })
         hasError = true
         continue
       }
-      const safeNickname = maskDisplayName(userDetail.data.nickname)
-      printMagenta(`账号 ${safeNickname} 开始领取VIP...`)
-
-      // 周日刷新token
-      if (today.getDay() === 0) {
-        const refreshToken = await send(`/login/token?timestrap=${Date.now()}`, "POST", headers)
-        if (refreshToken?.status == 1) {
-          if (refreshToken?.data?.token !== user.token) {
-            needRefresh = true
-            printYellow(`账号 ${safeNickname} 需要刷新token`)
-            user.token = refreshToken.data.token
-          }
-        }
-      }
-
-      // 开始听歌
-      printYellow(`开始听歌领取VIP...`)
-      // 听歌获取vip
-      const listen = await send(`/youth/listen/song?timestrap=${Date.now()}`, "GET", headers)
-
-      let listenStatus = '未知'
-      if (listen.status === 1) {
-        printGreen("听歌领取成功")
-        listenStatus = '成功'
-      } else if (listen.error_code === 130012) {
-        printGreen("今日已领取")
-        listenStatus = '今日已领取'
-      } else {
-        errorMsg[`${safeNickname} listen`] = summarizeResponse(listen)
-        printRed("听歌领取失败")
-        listenStatus = '失败'
-        hasError = true
-      }
-
-      printYellow("开始领取VIP...")
-      let claimCount = 0
-      let claimTotal = 0
-      for (let i = 1; i <= 8; i++) {
-        // ad获取vip
-        const ad = await send(`/youth/vip?timestrap=${Date.now()}`, "GET", headers)
-        claimTotal = i
-        if (ad.status === 1) {
-          printGreen(`第${i}次领取成功`)
-          claimCount++
-          if (i != 8) {
-            await delay(30 * 1000)
-          }
-        } else if (ad.error_code === 30002) {
-          printGreen("今天次数已用光")
-          break
-        } else {
-          printRed(`第${i}次领取失败`)
-          errorMsg[`${safeNickname} ad`] = summarizeResponse(ad)
-          hasError = true
-          break
-        }
-      }
-
-      let vipExpiry = '未知'
-      const vip_details = await send(`/user/vip/detail?timestrap=${Date.now()}`, "GET", headers)
-      if (vip_details.status === 1 && Array.isArray(vip_details.data?.busi_vip) && vip_details.data.busi_vip.length > 0) {
-        vipExpiry = vip_details.data.busi_vip[0].vip_end_time
-        printBlue(`今天是：${date}`)
-        printBlue(`VIP到期时间：${vipExpiry}\n`)
-      } else {
-        printRed("获取失败\n")
-        errorMsg[`${safeNickname} vip_details`] = summarizeResponse(vip_details)
-        hasError = true
-      }
-
-      notifyResults.push({
-        nickname: safeNickname,
-        status: listenStatus === '失败' || claimCount === 0 ? '部分失败' : '成功',
-        listen: listenStatus,
-        vipClaim: `${claimCount}/${claimTotal}`,
-        vipExpiry,
-        error: ''
-      })
     }
 
   } finally {

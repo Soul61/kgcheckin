@@ -5,6 +5,32 @@ function delay(ms) {
   return new Promise(resolve => setTimeout(resolve, ms))
 }
 
+/**
+ * 等待本地 api 服务就绪（启动竞态修复）。
+ * 原先各脚本在 startService() 后盲目 delay(2000)，
+ * 在冷启动的 Actions runner 上可能因服务未就绪导致首个请求失败/超时。
+ * 改为轮询探测：服务端口可响应任意 HTTP 即视为就绪，最多等待 timeoutMs。
+ * @param {string} base 服务地址
+ * @param {number} timeoutMs 最长等待毫秒
+ */
+async function waitForApi(base = 'http://127.0.0.1:3000', timeoutMs = 20000) {
+  const start = Date.now()
+  while (Date.now() - start < timeoutMs) {
+    try {
+      const controller = new AbortController()
+      const timer = setTimeout(() => controller.abort(), 2000)
+      const resp = await fetch(base + '/user/detail', { method: 'GET', signal: controller.signal })
+      clearTimeout(timer)
+      // 任意 HTTP 响应（含 4xx/5xx）都说明服务已在监听端口
+      return true
+    } catch (err) {
+      // 连接被拒（ECONNREFUSED）等服务尚未就绪，稍后重试
+      await delay(500)
+    }
+  }
+  throw new Error(`本地 API 服务在 ${timeoutMs}ms 内未就绪`)
+}
+
 /** 启动 api 服务（detached 使其成为独立进程组，便于整组强杀） */
 function startService() {
   const api = spawn('npm', ['run', 'apiService'], {
@@ -29,6 +55,7 @@ function startService() {
  * 因此用 detached 进程组 + process.kill(-pid) 强杀整组。
  */
 function close_api(api) {
+  if (!api || !api.pid) return
   try {
     process.kill(-api.pid, 'SIGKILL') // 杀掉整个进程组（npm + Express）
   } catch (e) {
@@ -69,4 +96,4 @@ async function send(path, method, headers) {
   throw lastError
 }
 
-export { delay, startService, close_api, send }
+export { delay, startService, close_api, send, waitForApi }

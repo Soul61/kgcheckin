@@ -1,7 +1,7 @@
 import { printGreen, printRed, printYellow } from "./utils/colorOut.js";
 import { sanitizeForLog, summarizeResponse } from "./utils/safeLog.js";
 import { upsertUser, saveUserinfo } from "./utils/userinfo.js";
-import { close_api, delay, send, startService } from "./utils/utils.js";
+import { close_api, delay, send, startService, waitForApi } from "./utils/utils.js";
 
 async function login() {
 
@@ -15,9 +15,14 @@ async function login() {
   if (!phone || !code) {
     throw new Error("未配置")
   }
-  // 启动服务
+  // 启动服务并等待就绪（避免冷启动竞态）
   const api = startService()
-  await delay(2000)
+  try {
+    await waitForApi()
+  } catch (e) {
+    close_api(api)
+    throw e
+  }
 
   try {
     // 手机号登录请求

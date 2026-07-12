@@ -160,6 +160,10 @@ function sendMailSMTP(title, content, cfg) {
     const date = new Date().toUTCString()
     const messageId = `<${Date.now()}.${Math.random().toString(36).slice(2)}@kgcheckin>`
 
+    // SMTP dot-stuffing：正文任意以 "." 开头的行必须再补一个点，
+    // 否则会被服务器当作数据结束符（<CR><LF>.<CR><LF>）提前截断邮件。
+    const safeContent = String(content).replace(/^\./gm, '..')
+
     const mailBody = [
       `From: ${from}`,
       `To: ${to}`,
@@ -170,7 +174,7 @@ function sendMailSMTP(title, content, cfg) {
       'Content-Type: text/plain; charset=UTF-8',
       'Content-Transfer-Encoding: 8bit',
       '',
-      content,
+      safeContent,
     ].join('\r\n')
 
     // 隐式 TLS (465) 直接 TLS 连接；STARTTLS (587/25) 先明文再升级

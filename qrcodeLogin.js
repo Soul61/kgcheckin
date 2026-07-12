@@ -1,6 +1,6 @@
 import { createRequire } from 'module'
 import fs from 'node:fs'
-import { close_api, delay, send, startService } from "./utils/utils.js";
+import { close_api, delay, send, startService, waitForApi } from "./utils/utils.js";
 import { printGreen, printMagenta, printRed, printYellow } from "./utils/colorOut.js";
 import { summarizeResponse } from "./utils/safeLog.js";
 import { upsertUser, saveUserinfo } from "./utils/userinfo.js";
@@ -136,7 +136,12 @@ function resolveNumber() {
  */
 async function genMode() {
   const api = startService()
-  await delay(2000)
+  try {
+    await waitForApi()
+  } catch (e) {
+    close_api(api)
+    throw e
+  }
   const number = resolveNumber()
   const keys = []
 
@@ -205,7 +210,12 @@ async function genMode() {
  */
 async function waitMode() {
   const api = startService()
-  await delay(2000)
+  try {
+    await waitForApi()
+  } catch (e) {
+    close_api(api)
+    throw e
+  }
   let parsed
   try {
     parsed = JSON.parse(fs.readFileSync(KEYS_FILE, 'utf8'))
